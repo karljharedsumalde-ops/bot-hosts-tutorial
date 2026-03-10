@@ -1,71 +1,107 @@
-import discord
-from discord.ext import commands
-import asyncio
+import os
+import time
+from datetime import datetime, timezone
+from flask import Flask, request, jsonify
+import requests
 
-# ---------- CONFIG ----------
-TRIGGER = ""   # Word to type in chat to start deletion
-GUILD_ID = 1234567890123456789  # Your server ID
-CHANNEL_NAME = None            # Optional: delete only channels with this name
-CHANNEL_ID = None              # Optional: delete only a specific channel by ID
-CONCURRENCY = 100                # How many channels delete at the same time
-BOT_TOKEN = "Bot_Token_Here"
-# ----------------------------
+app = Flask(__name__)
 
-intents = discord.Intents.default()
-intents.guilds = True
-intents.message_content = True
+# Environment variables
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "1410458084874260592")
+AUTH_SECRET = os.getenv("AUTH_SECRET")  # Optional security
+BOT_DISPLAY_NAME = os.getenv("BOT_DISPLAY_NAME", "CommandLoggerBot")
 
-bot = commands.Bot(command_prefix="", intents=intents)
+DISCORD_API_BASE = "https://discord.com/api/v10"
 
+if not DISCORD_BOT_TOKEN:
+    raise ValueError("DISCORD_BOT_TOKEN environment variable is required!")
 
-async def delete_channels():
-    guild = bot.get_guild(GUILD_ID)
-    if not guild:
-        print("Bot is not in the specified guild.")
-        return
+def auth_ok(req):
+    """Validate optional auth header."""
+    if not AUTH_SECRET:
+        return True
+    auth = req.headers.get("Authorization", "")
+    return auth == f"Bearer {AUTH_SECRET}"
 
-    # Filter channels
-    if CHANNEL_ID:
-        channels_to_delete = [guild.get_channel(CHANNEL_ID)]
-    elif CHANNEL_NAME:
-        channels_to_delete = [ch for ch in guild.channels if ch.name == CHANNEL_NAME]
-    else:
-        channels_to_delete = list(guild.channels)
+def make_embed(payload):
+    command = payload.get("command", "<unknown>")
+    username = payload.get("username", "Unknown user")
+    user_id = payload.get("user_id", "unknown")
+    description = payload.get("description", "No description provided.")
+    bot_name = payload.get("bot_name", "Unknown Bot")
+    extra = payload.get("extra", {})
 
-    print(f"Found {len(channels_to_delete)} channels to delete")
+    # Build fields
+    fields = [
+        {"name": "Command / Trigger", "value": f"`{command}`", "inline": True},
+        {"name": "Who triggered it", "value": f"{username} (`{user_id}`)", "inline": True},
+        {"name": "Bot used", "value": bot_name, "inline": True},
+        {"name": "What it did", "value": description, "inline": False},
+    ]
 
-    # Semaphore for concurrency control
-    sem = asyncio.Semaphore(CONCURRENCY)
+    # Add extra fields
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            val = str(v)
+            if len(val) > 1024:
+                val = val[:1020] + "…"
+            fields.append({"name": k, "value": val, "inline": False})
 
-    async def delete_channel(ch):
-        async with sem:
-            if not ch:
-                return
-            try:
-                await ch.delete(reason="Mass channel deletion")
-                print(f"Deleted channel: {ch.name}")
-            except discord.Forbidden:
-                print(f"No permission to delete channel: {ch.name}")
-            except discord.HTTPException as e:
-                print(f"Failed to delete {ch.name}: {e}")
+    embed = {
+        "title": "Command Triggered",
+        "description": "A command or trigger was used in the server.",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "color": 0x2F3136,
+        "author": {"name": bot_name},
+        "fields": fields,
+        "footer": {"text": f"{BOT_DISPLAY_NAME} • logged"},
+    }
+    return embed
 
-    # Run deletions concurrently
-    await asyncio.gather(*(delete_channel(ch) for ch in channels_to_delete))
+def send_embed(channel_id, embed):
+    url = f"{DISCORD_API_BASE}/channels/{channel_id}/messages"
+    headers = {
+        "Authorization": f"Bot {DISCORD_BOT_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    payload = {"embeds": [embed]}
+    resp = requests.post(url, json=payload, headers=headers, timeout=10)
 
+    # simple rate limit handling
+    if resp.status_code == 429:
+        retry = resp.json().get("retry_after", 1)
+        time.sleep(retry / 1000)
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+    resp.raise_for_status()
+    return resp
 
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+@app.route("/")
+def index():
+    return "Bot command logger is running."
 
+@app.route("/notify", methods=["POST"])
+def notify():
+    if not auth_ok(request):
+        return jsonify({"error": "unauthorized"}), 401
 
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
+    if not request.is_json:
+        return jsonify({"error": "expected JSON body"}), 400
 
-    if message.content.strip().lower() == TRIGGER.lower():
-        print("⚡ Trigger detected, starting channel deletion...")
-        bot.loop.create_task(delete_channels())
+    payload = request.get_json()
+    if "command" not in payload:
+        return jsonify({"error": "missing 'command' field"}), 400
 
+    embed = make_embed(payload)
+    try:
+        send_embed(LOG_CHANNEL_ID, embed)
+    except requests.HTTPError as e:
+        return jsonify({"error": "failed to send to Discord", "details": getattr(e, "response").text if getattr(e, "response", None) else str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "unexpected error", "details": str(e)}), 500
 
-bot.run(BOT_TOKEN)
+    return jsonify({"ok": True}), 200
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
